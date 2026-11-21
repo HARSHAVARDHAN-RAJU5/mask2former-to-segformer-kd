@@ -30,7 +30,7 @@ os.environ.setdefault("HF_HOME", "/mnt/nunnari3/hf_cache")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kd import classes as C  # noqa: E402
-from kd.dataset import MEAN, STD, TrainSet, ValSet  # noqa: E402
+from kd.dataset import MEAN, STD, IndianSet, TrainSet, ValSet, frame_confidences  # noqa: E402
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -42,8 +42,9 @@ from transformers import SegformerForSemanticSegmentation  # noqa: E402
 STUDENT = "nvidia/segformer-b1-finetuned-cityscapes-1024-1024"
 
 
-def kd_ce_loss(logits, y, t, alpha, T):
-    """logits (B,31,h,w) student scores at 1/4 size; y (B,H,W) labels; t (B,31,h,w) teacher probs."""
+def kd_ce_loss(logits, y, t, alpha, T, kd_mask=None):
+    """logits (B,31,h,w) student scores at 1/4 size; y (B,H,W) labels; t (B,31,h,w) teacher probs;
+    kd_mask (B,h,w) bool = cells to learn from the teacher (default: label present at the cell centre)."""
     logits = logits.float()
     up = F.interpolate(logits, size=y.shape[-2:], mode="bilinear", align_corners=False)
     if (y != C.IGNORE_ID).any():
@@ -52,7 +53,7 @@ def kd_ce_loss(logits, y, t, alpha, T):
         ce = logits.sum() * 0.0
     if alpha == 0:
         return ce, ce.detach(), torch.zeros((), device=ce.device)
-    valid = y[:, 2::4, 2::4] != C.IGNORE_ID  # label at the centre of each 4x4 block
+    valid = kd_mask if kd_mask is not None else y[:, 2::4, 2::4] != C.IGNORE_ID
     # select valid cells first (padding / ignore cells never enter the maths), then (cells, 31)
     tv = t.float().permute(0, 2, 3, 1)[valid]
     lv = logits.permute(0, 2, 3, 1)[valid]
@@ -115,18 +116,39 @@ def lineup(ds, n, out, wide_only=False):
         order = [i for i in order[:3000]
                  if cut_4_3(*Image.open(os.path.join(ds.img_dir, ds.names[i] + ".jpg")).size, False)[1] < 1]
     for k, i in enumerate(order[:n]):
-        x, y, t = ds[i]
+        x, y, t, m = ds[i]
         photo = ((x * STD + MEAN).clamp(0, 1) * 255).byte().permute(1, 2, 0).numpy()
         lab = pal[y.numpy().astype(np.uint8)]
         top = t.float().argmax(0).numpy().astype(np.uint8)
         tea = np.repeat(np.repeat(pal[top], 4, 0), 4, 1)
+        keep = np.repeat(np.repeat(m.numpy(), 4, 0), 4, 1)[..., None]
+        learned = np.where(keep, photo, photo // 4)  # dark = the teacher is NOT learned there
         yc = y[2::4, 2::4].numpy()
         v = yc != C.IGNORE_ID
         agree = (top[v] == yc[v]).mean() * 100 if v.any() else float("nan")
-        Image.fromarray(np.concatenate([photo, lab, tea], 1)).save(os.path.join(out, f"lineup_{k}.jpg"), quality=90)
+        Image.fromarray(np.concatenate([photo, lab, tea, learned], 1)).save(os.path.join(out, f"lineup_{k}.jpg"), quality=90)
         w, h = Image.open(os.path.join(ds.img_dir, ds.names[i] + ".jpg")).size
-        print(f"  lineup_{k}.jpg  {ds.names[i]}  ({w}x{h}, {w / h:.2f}:1)  "
-              f"teacher top class = label on {agree:.1f}% of labelled pixels")
+        print(f"  lineup_{k}.jpg  {ds.names[i]}  ({w}x{h}, {w / h:.2f}:1)  teacher top class = label on "
+              f"{agree:.1f}% of labelled pixels; teacher learned on {m.float().mean() * 100:.0f}% of cells")
+
+
+def indian_names(a):
+    """Indian frames to train on: in the keep list (indoor/ATM already removed), cached, and with average
+    teacher confidence >= --indian-frame-conf. Confidences are computed once and stored in the run folder."""
+    listed = [l.strip()[:-4] for l in open(a.indian_list) if l.strip()]
+    names = [n for n in listed if os.path.exists(os.path.join(a.indian_cache, n + ".npz"))]
+    if len(names) < len(listed):
+        print(f"WARNING: only {len(names)} of {len(listed)} listed Indian frames are cached")
+    path = os.path.join(a.out, "indian_frame_conf.json")
+    conf = json.load(open(path)) if os.path.exists(path) else {}
+    todo = [n for n in names if n not in conf]
+    if todo:
+        conf.update(frame_confidences(a.indian_cache, todo))
+        with open(path, "w") as f:
+            json.dump(conf, f)
+    keep = [n for n in names if conf[n] >= a.indian_frame_conf]
+    print(f"Indian frames: {len(names)} cached, {len(keep)} with average teacher confidence >= {a.indian_frame_conf}")
+    return keep
 
 
 def save(path, obj):
@@ -159,15 +181,31 @@ def main():
     ap.add_argument("--max-steps", type=int, default=0, help="stop after N steps this session (0 = no limit)")
     ap.add_argument("--lineup", type=int, default=0)
     ap.add_argument("--lineup-wide", action="store_true", help="line-up check on photos wider than 4:3 only")
+    ap.add_argument("--lineup-indian", action="store_true", help="line-up check on the Indian frames")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--init", default="", help="start from a COPY of these weights (e.g. a saved best.pt); "
+                                               "the file itself is only read")
+    ap.add_argument("--indian-images", default="", help="unlabeled Indian frames (teacher only)")
+    ap.add_argument("--indian-cache", default="")
+    ap.add_argument("--indian-list", default="", help="frame file names to use (indoor/ATM already removed)")
+    ap.add_argument("--indian-frame-conf", type=float, default=0.80, help="drop frames with lower average confidence")
+    ap.add_argument("--indian-pixel-conf", type=float, default=0.90, help="learn the teacher only where this sure")
+    ap.add_argument("--indian-share", type=float, default=0.5, help="share of each batch that is Indian frames")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     random.seed(a.seed)
     torch.manual_seed(a.seed)
+    if a.init:
+        assert os.path.dirname(os.path.abspath(a.init)) != os.path.abspath(a.out), \
+            "--out must not be the folder of --init (the saved model must never be written)"
 
     train_ds = TrainSet(a.data, a.cache, side=a.side, crop=a.crop)
+    indian_ds = None
+    if a.indian_images:
+        indian_ds = IndianSet(a.indian_images, a.indian_cache, indian_names(a), side=a.side, crop=a.crop,
+                              pixel_conf=a.indian_pixel_conf)
     if a.lineup:
-        lineup(train_ds, a.lineup, a.out, wide_only=a.lineup_wide)
+        lineup(indian_ds if a.lineup_indian else train_ds, a.lineup, a.out, wide_only=a.lineup_wide)
         return
 
     model = SegformerForSemanticSegmentation.from_pretrained(
@@ -189,19 +227,29 @@ def main():
         scaler.load_state_dict(ck["scaler"])
         step, best = ck["step"], ck["best"]
         print(f"Resuming from step {step} (best val mIoU so far {best:.4f})")
+    elif a.init:
+        model.load_state_dict(torch.load(a.init, map_location="cuda", weights_only=False)["model"])
+        print(f"Starting from a copy of {a.init}")
     else:
         print(f"Starting from {STUDENT}")
     with open(os.path.join(a.out, "args.json"), "w") as f:
         json.dump(vars(a), f, indent=1)
 
-    loader = torch.utils.data.DataLoader(train_ds, batch_size=a.batch, shuffle=True, drop_last=True,
-                                         num_workers=a.workers, pin_memory=True, persistent_workers=True)
-    val_loader = torch.utils.data.DataLoader(ValSet(a.data, side=a.side, limit=a.val_limit), batch_size=1, num_workers=4)
-
-    def batches():
+    def endless(ds, batch, workers):
+        dl = torch.utils.data.DataLoader(ds, batch_size=batch, shuffle=True, drop_last=True,
+                                         num_workers=workers, pin_memory=True, persistent_workers=True)
         while True:
-            yield from loader
-    it = batches()
+            yield from dl
+
+    if indian_ds is None:
+        it = endless(train_ds, a.batch, a.workers)
+    else:  # every batch = Mapillary part + Indian part, joined
+        b_ind = round(a.batch * a.indian_share)
+        print(f"Each batch: {a.batch - b_ind} Mapillary + {b_ind} Indian")
+        it_map = endless(train_ds, a.batch - b_ind, max(1, a.workers // 2))
+        it_ind = endless(indian_ds, b_ind, max(1, a.workers // 2))
+        it = (tuple(torch.cat(p) for p in zip(next(it_map), next(it_ind))) for _ in iter(int, 1))
+    val_loader = torch.utils.data.DataLoader(ValSet(a.data, side=a.side, limit=a.val_limit), batch_size=1, num_workers=4)
 
     stop_at = min(a.iters, step + a.max_steps) if a.max_steps else a.iters
     train_log = open(os.path.join(a.out, "train_log.csv"), "a")
@@ -216,11 +264,10 @@ def main():
         for g, base in zip(opt.param_groups, base_lrs):
             g["lr"] = base * f
         for _ in range(a.accum):
-            x, y, t = next(it)
-            x, y, t = x.cuda(non_blocking=True), y.cuda(non_blocking=True), t.cuda(non_blocking=True)
+            x, y, t, m = (v.cuda(non_blocking=True) for v in next(it))
             with torch.autocast("cuda", dtype=torch.float16):
                 logits = model(pixel_values=x).logits
-            loss, ce, kd = kd_ce_loss(logits, y, t, a.alpha, a.T)
+            loss, ce, kd = kd_ce_loss(logits, y, t, a.alpha, a.T, kd_mask=m)
             scaler.scale(loss / a.accum).backward()
             run["loss"] += loss.item()
             run["ce"] += ce.item()

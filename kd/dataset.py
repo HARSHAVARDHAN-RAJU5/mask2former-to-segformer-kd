@@ -79,27 +79,24 @@ def cut_and_resize_map(tmap, u, f, out_h, out_w):
     return F.grid_sample(tmap[None], grid, mode="bilinear", padding_mode="border", align_corners=False)[0]
 
 
-class TrainSet(torch.utils.data.Dataset):
-    """Returns (photo (3,crop,crop), label (crop,crop), teacher map (31,crop/4,crop/4) float16)."""
+def load_teacher_conf(path):
+    """The teacher's own top-1 probability per map pixel, as cached (1, h, w) — what Test B measured."""
+    return torch.from_numpy(np.load(path)["prob"][0].astype(np.float32))[None]
 
-    def __init__(self, data, cache, side=512, crop=512, scale=(0.5, 1.5), flip=True, jitter=True):
+
+class _Augment:
+    """Shared 4:3 cut / stretch / zoom / pad / crop / flip, identical for every source."""
+
+    def __init__(self, side, crop, scale, flip, jitter):
         assert crop % 4 == 0 and side % 4 == 0, "side and crop must be multiples of 4"
-        self.img_dir = os.path.join(data, "training/images")
-        self.lab_dir = os.path.join(data, "training/v1.2/labels")
-        self.cache = cache
-        self.names = sorted(f[:-4] for f in os.listdir(self.img_dir))
-        missing = [n for n in self.names if not os.path.exists(os.path.join(cache, n + ".npz"))]
-        assert not missing, f"{len(missing)} photos have no teacher cache file, e.g. {missing[:3]}"
-        self.lut = dataset_lut(data)
         self.side, self.crop, self.scale, self.flip = side, crop, scale, flip
         self.jitter = ColorJitter(0.2, 0.2, 0.2) if jitter else None
 
-    def __len__(self):
-        return len(self.names)
-
-    def __getitem__(self, i):
-        name = self.names[i]
-        img = Image.open(os.path.join(self.img_dir, name + ".jpg"))
+    def sample(self, img_path, label, maps):
+        """label: PIL label image (31 classes / 255) or None (no human labels: all 255).
+        maps: (k, hm, wm) teacher map(s) for the whole photo; cut/resized/padded/cropped with the photo.
+        Returns photo (3,crop,crop), label (crop,crop), maps (k,crop/4,crop/4)."""
+        img = Image.open(img_path)
         u, f = cut_4_3(*img.size, random_pos=True)  # same cut for photo, label and map
 
         # stretch to a square like the app, with random zoom; the photo is always exactly 4x the map
@@ -111,15 +108,14 @@ class TrainSet(torch.utils.data.Dataset):
         img = img.convert("RGB").resize((pw, ph), Image.BILINEAR, box=box(u, f, img.size))
         if self.jitter:
             img = self.jitter(img)  # colour change: photo only
-        lab = Image.fromarray(self.lut[np.array(Image.open(os.path.join(self.lab_dir, name + ".png")))])
-        lab = lab.resize((pw, ph), Image.NEAREST, box=box(u, f, lab.size))
-        tmap = load_teacher_map(os.path.join(self.cache, name + ".npz"))  # whole photo, (31, hm, wm)
-
         x = normalize(img)
-        y = torch.from_numpy(np.array(lab)).long()
-        t = cut_and_resize_map(tmap, u, f, mh, mw)
+        if label is None:
+            y = torch.full((ph, pw), C.IGNORE_ID, dtype=torch.long)
+        else:
+            y = torch.from_numpy(np.array(label.resize((pw, ph), Image.NEAREST, box=box(u, f, label.size)))).long()
+        t = cut_and_resize_map(maps, u, f, mh, mw)
 
-        # pad up to the crop size if the zoomed photo is smaller (label 255, so CE and KD skip it)
+        # pad up to the crop size if the zoomed photo is smaller (label 255 and map 0, so nothing is learned there)
         c, cm = self.crop, self.crop // 4
         if ph < c or pw < c:
             pad_h, pad_w = max(0, c - ph), max(0, c - pw)  # multiples of 4
@@ -128,7 +124,7 @@ class TrainSet(torch.utils.data.Dataset):
             t = F.pad(t, (0, pad_w // 4, 0, pad_h // 4), value=0.0)
             mh, mw = mh + pad_h // 4, mw + pad_w // 4
 
-        # crop: same place for all three; chosen in map units, so the photo crop starts at a multiple of 4
+        # crop: same place for all; chosen in map units, so the photo crop starts at a multiple of 4
         oy, ox = random.randint(0, mh - cm), random.randint(0, mw - cm)
         x = x[:, oy * 4:oy * 4 + c, ox * 4:ox * 4 + c]
         y = y[oy * 4:oy * 4 + c, ox * 4:ox * 4 + c]
@@ -136,7 +132,61 @@ class TrainSet(torch.utils.data.Dataset):
 
         if self.flip and random.random() < 0.5:
             x, y, t = x.flip(-1), y.flip(-1), t.flip(-1)
-        return x.contiguous(), y.contiguous(), t.half().contiguous()
+        return x.contiguous(), y.contiguous(), t
+
+
+class TrainSet(torch.utils.data.Dataset):
+    """Mapillary: human labels + teacher. Returns (photo (3,crop,crop), label (crop,crop),
+    teacher map (31,crop/4,crop/4) float16, kd mask (crop/4,crop/4) bool = label present at the cell centre)."""
+
+    def __init__(self, data, cache, side=512, crop=512, scale=(0.5, 1.5), flip=True, jitter=True):
+        self.img_dir = os.path.join(data, "training/images")
+        self.lab_dir = os.path.join(data, "training/v1.2/labels")
+        self.cache = cache
+        self.names = sorted(f[:-4] for f in os.listdir(self.img_dir))
+        missing = [n for n in self.names if not os.path.exists(os.path.join(cache, n + ".npz"))]
+        assert not missing, f"{len(missing)} photos have no teacher cache file, e.g. {missing[:3]}"
+        self.lut = dataset_lut(data)
+        self.aug = _Augment(side, crop, scale, flip, jitter)
+
+    def __len__(self):
+        return len(self.names)
+
+    def __getitem__(self, i):
+        name = self.names[i]
+        lab = Image.fromarray(self.lut[np.array(Image.open(os.path.join(self.lab_dir, name + ".png")))])
+        tmap = load_teacher_map(os.path.join(self.cache, name + ".npz"))  # whole photo, (31, hm, wm)
+        x, y, t = self.aug.sample(os.path.join(self.img_dir, name + ".jpg"), lab, tmap)
+        m = y[2::4, 2::4] != C.IGNORE_ID  # label at the centre of each 4x4 block
+        return x, y, t.half().contiguous(), m.contiguous()
+
+
+class IndianSet(torch.utils.data.Dataset):
+    """Unlabeled frames: teacher only. Label is all 255 (no CE). KD only where the teacher's own top-1
+    probability is >= pixel_conf. Same output format as TrainSet."""
+
+    def __init__(self, images, cache, names, side=512, crop=512, scale=(0.5, 1.5), flip=True, jitter=True,
+                 pixel_conf=0.9):
+        self.img_dir, self.cache, self.names, self.pixel_conf = images, cache, list(names), pixel_conf
+        missing = [n for n in self.names if not os.path.exists(os.path.join(cache, n + ".npz"))]
+        assert not missing, f"{len(missing)} frames have no teacher cache file, e.g. {missing[:3]}"
+        self.aug = _Augment(side, crop, scale, flip, jitter)
+
+    def __len__(self):
+        return len(self.names)
+
+    def __getitem__(self, i):
+        name = self.names[i]
+        path = os.path.join(self.cache, name + ".npz")
+        maps = torch.cat([load_teacher_map(path), load_teacher_conf(path)])  # (31 + 1, hm, wm)
+        x, y, t = self.aug.sample(os.path.join(self.img_dir, name + ".jpg"), None, maps)
+        m = t[31] >= self.pixel_conf  # padding has conf 0 -> never learned
+        return x, y, t[:31].half().contiguous(), m.contiguous()
+
+
+def frame_confidences(cache, names):
+    """Average teacher top-1 probability per frame (the Test B number)."""
+    return {n: float(np.load(os.path.join(cache, n + ".npz"))["prob"][0].astype(np.float32).mean()) for n in names}
 
 
 class ValSet(torch.utils.data.Dataset):
