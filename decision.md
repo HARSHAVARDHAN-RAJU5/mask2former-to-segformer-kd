@@ -161,5 +161,46 @@ reference, not the truth — biased in favour of our students, which learned fro
 - Head-camera views looking down at the ground are hard for every model (Mapillary is car-mounted, looking forward).
 - B0 here = `nvidia/segformer-b0-finetuned-ade-512-512` with standard normalization; the phone's exact pipeline may differ.
 
-## Export (later)
-- Build the colour normalization (ImageNet mean/std) into the exported model, so the phone keeps feeding RGB 0–1.
+## Export to the phone NPU (KD student)
+- Model: KD student (`saved_models/mapillary_kd_a0.5/best.pt`). Not public: binaries stay on the conversion server
+  with a private copy on the PC, never in a repo.
+- ONNX (kd/export_onnx.py, opset 17, onnxsim): same layout as the phone's SegFormer-B0 — input `image`
+  1×512×512×3 RGB 0–1 (colour normalization inside), output `class_logits` 1×128×128×31, channel-last.
+  ONNX vs PyTorch: 100% class-map match on 8 Indian frames (max logit diff 4e-5).
+- Calibration (kd/build_calib.py): 200 phone-like images = 176 Mapillary train + 24 Indian frames.
+  Accuracy checks use Mapillary val photos, never used for calibration.
+- Conversion (kd/npu_convert.sh): QAIRT 2.47, existing export venv used read-only, `--preserve_io layout`,
+  same HTP settings as B0 (v81, soc_model 87, O3, VTCM 8 MB; fp16 relaxed precision for fp16).
+
+| Build | Size | B0 (phone today) |
+|---|---|---|
+| fp16 | 30.5 MB | 8.6 MB |
+| w8a16 (8-bit weights, 16-bit activations, per-channel, CLE) | 16.8 MB | 5.2 MB |
+
+**Phone test** (kd/phone_test.py; OnePlus 15 CPH2745, SM8850, Android 16, USB; qnn-net-run, burst, 100 runs;
+NPU time from the profile log). Clean run: all HearSight apps uninstalled, no battery saver, thermal status 0.
+(Runs with the app installed gave the same B0 numbers, so the app was not the cause.)
+
+| Model | NPU avg | min | max |
+|---|---|---|---|
+| B0 fp16 (phone today) | 64.5 ms | 62.6 | 67.6 |
+| B0 w8a16 | 47.0 ms | 44.1 | 74.3 |
+| **B1 fp16 (ours)** | 110.0 ms | 93.2 | 124.2 |
+| **B1 w8a16 (ours)** | 78.2 ms | 59.8 | 89.4 |
+
+| Accuracy, 200 Mapillary val photos (phone-like, not used for calibration) | Class map = ONNX | mIoU phone | mIoU ONNX |
+|---|---|---|---|
+| B1 fp16 | 99.97% | 0.4986 | 0.4986 |
+| B1 w8a16 | 99.34% (worst photo 93.3%) | 0.4970 | 0.4986 |
+
+- Quantization costs almost nothing: w8a16 loses 0.002 mIoU. (0.499 on these 200 photos vs 0.537 on all 2,000:
+  subset difference, same model.)
+- Speed: B1 ≈ 1.7× B0 (fp16 110 vs 65 ms; w8a16 78 vs 47 ms). Same 1.5–1.7× in every run.
+- The earlier cloud figures for B0 (12.6 / 10.0 ms, Galaxy S26, runtime 2.50) are ~5× lower than this real
+  OnePlus 15 with qnn-net-run 2.47.
+- **Why (option C):** on this retail phone the NPU runs in *unsigned PD* mode (log: `Unsigned:Y, Signed:N`) and
+  the clock vote is refused (`Access denied … persist.vendor.fastrpc.process.clockvote`). Every perf profile gives
+  the same B0 time (low_power_saver 64.7, balanced 64.5, burst 64.4 ms) → the NPU clock is fixed at its default.
+  Cloud test phones are not limited this way. A normal app is also unsigned, so it very likely gets the same speed —
+  not yet confirmed inside the HearSight app (its engine logs NPU time).
+- Spec goal: segmentation ≥ 10 Hz (≤ 100 ms/frame). B1 w8a16 (78 ms) meets it alone; B1 fp16 (110 ms) does not.
