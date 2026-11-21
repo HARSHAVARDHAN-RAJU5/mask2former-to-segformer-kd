@@ -72,12 +72,17 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--verify", type=int, default=3, help="saved files to re-check against the live teacher")
     ap.add_argument("--failed", default="", help="failed-photo log (default: <out>_failed.txt next to --out)")
+    ap.add_argument("--images", default="", help="photo folder (default: <data>/training/images)")
+    ap.add_argument("--list", default="", help="text file of photo file names to use (default: all in the folder)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     failed_log = a.failed or a.out.rstrip("/") + "_failed.txt"
 
-    folder = os.path.join(a.data, "training/images")
+    folder = a.images or os.path.join(a.data, "training/images")
     all_names = sorted(os.listdir(folder))
+    if a.list:
+        wanted = {l.strip() for l in open(a.list) if l.strip()}
+        all_names = [n for n in all_names if n in wanted]
     names = all_names[:a.limit] if a.limit else all_names
     todo = [n for n in names if not os.path.exists(os.path.join(a.out, n[:-4] + ".npz"))]
     print(f"{len(names)} photos selected, {len(names) - len(todo)} already cached, {len(todo)} to do")
