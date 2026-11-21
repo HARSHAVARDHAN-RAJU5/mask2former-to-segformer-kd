@@ -226,6 +226,39 @@ checksum unchanged):
   model: sidewalk). Walkable ground on Indian frames is still not reliable. Batches 50% Mapillary (human labels +
   teacher) / 50% Indian (teacher only). One run. Discard if Mapillary val drops.
 
+## Status: distillation done (2026-11-22)
+- **Final model: run 3** (`saved_models/run3_indian/best.pt`): Mapillary val mIoU 0.543; best of all runs on the
+  held-back Indian videos and in the pictures.
+- Stop here: a smaller student (B0) would lose accuracy, and further gains need real labeled Indian data —
+  the Mapillary teacher has given what it can (unsure on Indian ground, no Indian-only classes).
+- Known gaps: walkable ground on Indian frames (sidewalk vs road vs terrain) not reliable; pothole and curb cut 0;
+  the app's walkable rule (road + terrain) is wrong for India.
+- **Clean-up (2026-11-22):** training data deleted — Mapillary dataset, Mapillary + Indian teacher caches, Indian
+  frames, test pictures, calibration raws, phone test data. All models kept (saved models, run folders, test
+  runs, ONNX, phone builds). Retraining needs the dataset re-copied (~4 h) and the caches rebuilt (~3 h);
+  Indian frames are still in S3.
+
+## Final comparison (same 200 phone-like Mapillary val photos, 512×512, scored vs human labels)
+| Model | Where | mIoU | Speed (NPU, this phone) | Size |
+|---|---|---|---|---|
+| Mask2Former Swin-L (teacher) | server GPU (phone: fails) | **0.5945** | — | 800 MB fp16 |
+| **Run 3 w8a16** | phone | **0.5238** | 78.5 ms | 16.8 MB |
+| Run 3 fp16 | phone | 0.5254 | 113.3 ms | 30.5 MB |
+| KD student w8a16 | phone | 0.4970 | 77.9 ms | 16.8 MB |
+| KD student fp16 | phone | 0.4986 | 110 ms | 30.5 MB |
+| B0 ADE (phone today) | phone | — (other classes) | 47 / 65 ms (w8a16 / fp16) | 5.2 / 8.6 MB |
+
+- Run 3 on the phone ≈ 88% of the teacher's mIoU at 1/50 of its size; NPU conversion costs ≤ 0.002 mIoU.
+- **Mask2Former cannot run on this phone:** the fp16 context binary (built separately, 512×512, 100 query outputs)
+  loads, then the NPU process crashes during execution (`err 1003`, CDSP restart). The log estimates ~1.9 GB of NPU
+  process memory (weights 665 MB, spill-fill 841 MB, runlist 472 MB) — too much for the unsigned PD on a retail
+  phone. The phone recovers by itself.
+
+**Video test** (kd/phone_video.py): Corridor.mp4 (640×480, 30 fps, 2,632 frames, campus paved walkway) through
+run 3 w8a16 on the phone NPU, app's preprocessing (nearest 512×512): **78.4 ms/frame average, stable over all
+frames.** Buildings, trees, sky, people and raised curbs look right. **The wide paved walkway is mostly called
+"road"** (only edges "sidewalk") — the Mapillary bias (wide paved surface = road); same walkable gap as above.
+
 ## Export to the phone NPU (KD student)
 - Model: KD student (`saved_models/mapillary_kd_a0.5/best.pt`). Not public: binaries stay on the conversion server
   with a private copy on the PC, never in a repo.
