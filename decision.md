@@ -72,9 +72,15 @@ Load warning "swin.layernorm MISSING": layer not used; 97% match confirms the te
 - The app **stretches** the whole camera frame (640×480) to 512×512, nearest-neighbour, no crop / pad
   (`engine/core/semseg.cpp` in the app).
 - So the student is trained and scored at that scale and shape: every frame is stretched to a square.
+- Photos wider than 4:3 (12.6% are 16:9, 2% other) are first cut to 4:3, like the camera:
+  training = random horizontal position, validation = centred. Same cut on photo, label and teacher map.
+  4:3 and narrower photos are kept whole.
+- Validation photo = centred 4:3 cut → camera size 640×480 → **nearest-neighbour** stretch to 512×512 (the app's step).
+  Training keeps bilinear. *Revisit if phone results look worse than validation.*
 
 ## Training (kd/dataset.py, kd/train.py)
-- Teacher map: top 5 → full 31-class map (rest 0, rescaled to 1), then the SAME stretch / zoom / cut / flip as photo and label.
+- Teacher map: top 5 → full 31-class map (rest 0, rescaled to 1), then the SAME 4:3 cut / stretch / zoom / crop / flip as photo and label
+  (exact fractional cut positions for all three).
   Teacher cache kept as is (not regenerated): the rebuilt map is resized with the photo.
 - Map is always exactly 1/4 of the photo; cuts start at multiples of 4 (map pixel = 4×4 photo pixels).
 - Stretch to a square of side 512 × random zoom 0.5–1.5, then cut 512×512; flip 50%; colour change on the photo only.
@@ -84,12 +90,14 @@ Load warning "swin.layernorm MISSING": layer not used; 97% match confirms the te
 | Setting | Choice | Why |
 |---|---|---|
 | KD formula | T² · KL(teacher_T ‖ student_T), teacher_T = p^(1/T) rescaled (= softmax(log p / T)) | Cache holds probabilities, not raw scores |
+| KD / CE masking | KD: valid cells are **selected** before the maths (not multiplied by 0); never log(0), classes outside the top 5 stay exactly 0. CE: all-ignore batch → 0, not NaN | Padded teacher cells are all zeros; NaN must never leak. Tested: no NaN, padded cells get 0 KD gradient, same numbers as before |
 | T | 2 | Task file |
 | alpha | 0.5, plus a baseline run with 0 | Baseline shows whether the teacher helped |
 | Crop / batch | 512 × 512, real batch 8, no accumulation | Match the phone input; fits easily (was 768, batch 4 × 2) |
 | Optimizer | AdamW 6e-5, new last layer ×10, weight decay 0.01, warm-up 1500, straight-line decay | SegFormer standard |
 | Length | Decide after measuring speed (default 40,000 steps) | |
-| Validation | Every 4,000 steps, photo stretched to 512×512, answer stretched back and scored at label full size; keep best + last | Same as the phone |
+| Validation | Every 4,000 steps, phone-like photo (see above), answer stretched back and scored at the label's full size (centred 4:3 cut); keep best + last + per-class IoU | Same as the phone |
+| Runs | alpha 0.5 (runs/kd_a0.5), then alpha 0 baseline (runs/kd_a0), back-to-back in one tmux session | Baseline shows whether the teacher helped |
 | Resume | Restart continues from last.pt (saved every 1,000 steps) | |
 
 | Test (512, stretched, batch 8) | Result |
@@ -98,3 +106,9 @@ Load warning "swin.layernorm MISSING": layer not used; 97% match confirms the te
 | 50-step run | Loss 7.62 → 3.02 (CE 3.18 → 0.98, KD 12.1 → 5.1); val mIoU 0.101 on 20 photos (expected this early) |
 | Speed / memory | 0.22 s/step → 40,000 steps ≈ 2.5 h + validation; peak GPU 3.1 GB of 16 |
 | Resume | Tested at 768 (restart at step 50 → 70, loss kept falling); same code path |
+| 4:3 cut line-up (6 wide photos, 16:9) | Teacher top class = label on 93–97% of pixels; pictures line up (incl. zoomed-out + flipped) |
+| 4:3 cut validation | 16:9 val photos → label cut to exactly 1.333:1; photo 512×512 |
+| 10-step run (4:3 cut) | Loss 7.88 → 7.24 (warm-up), GPU 3.1 GB; val on 50 photos takes 3 s (→ ~2 min for 2,000) |
+
+## Export (later)
+- Build the colour normalization (ImageNet mean/std) into the exported model, so the phone keeps feeding RGB 0–1.
