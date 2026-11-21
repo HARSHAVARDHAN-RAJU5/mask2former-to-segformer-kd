@@ -3,14 +3,15 @@
 # Same settings as the phone's SegFormer-B0 (hsv2-lite-app/models/segformer-b0-qairt2.47): v81, O3, VTCM 8 MB.
 # Writes ONLY inside $W (its own work folder); uses the shared QAIRT SDK, venvs and NDK read-only.
 #
-# Usage (on nunnari):  npu_convert.sh <fp16|w8a16>
-#   expects  $W/onnx/$NAME.onnx  and (for w8a16) $W/calib_raw/input_list.txt
+# Usage (on nunnari):  [W=<work folder>] [CALIB=<input_list.txt>] npu_convert.sh <fp16|w8a16>
+#   expects  $W/onnx/$NAME.onnx  and (for w8a16) $CALIB (default $W/calib_raw/input_list.txt)
 #   produces $W/dist/${NAME}_<mode>.bin  (+ logs in $W/logs)
 set -euo pipefail
 MODE=$1
-NAME=segformer_b1_31
+NAME=segformer_b1_31  # graph name; same I/O contract for every 31-class student
 R=/media/nunnari/projects/qairt
-W=$R/work_247/$NAME
+W=${W:-$R/work_247/$NAME}
+CALIB=${CALIB:-$W/calib_raw/input_list.txt}
 SDK=$R/2.47.0.260601
 export TMPDIR=$W/tmp
 mkdir -p $W/build/$MODE/model $W/build/$MODE/lib $W/ctx $W/dist $W/logs $TMPDIR
@@ -27,7 +28,7 @@ CMD=(qnn-onnx-converter --input_network $W/onnx/$NAME.onnx --input_dim image 1,5
      --preserve_io layout image class_logits --output_path $W/build/$MODE/model/$NAME.cpp)
 case $MODE in
   fp16)  CMD+=(--float_bitwidth 16) ;;
-  w8a16) CMD+=(--input_list $W/calib_raw/input_list.txt --act_bitwidth 16 --weights_bitwidth 8
+  w8a16) CMD+=(--input_list $CALIB --act_bitwidth 16 --weights_bitwidth 8
                --bias_bitwidth 32 --use_per_channel_quantization --algorithms cle) ;;
   *) echo "mode must be fp16 or w8a16"; exit 1 ;;
 esac

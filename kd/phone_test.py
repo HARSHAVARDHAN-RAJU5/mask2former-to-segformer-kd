@@ -57,6 +57,18 @@ def speed(model, n):
             "netrun_avg": stats["Average"][1], "load_ms": int(load.group(1)) / 1000, "ips": float(ips.group(1))}
 
 
+def m2f_scores(result_dir, matrix):
+    """Mask2Former phone outputs -> our 31-class scores (128,128,31), same maths as the teacher cache:
+    class probabilities (drop "no object") x mask probabilities, summed over the 100 queries, then merged."""
+    raws = glob.glob(os.path.join(result_dir, "*.raw"))
+    q = np.fromfile(next(p for p in raws if "class_queries" in p), np.float32).reshape(100, -1)
+    mk = np.fromfile(next(p for p in raws if "masks_queries" in p), np.float32).reshape(OUT, OUT, 100)
+    e = np.exp(q - q.max(-1, keepdims=True))
+    cls = (e / e.sum(-1, keepdims=True))[:, :-1]  # (100, 65)
+    per_pixel = np.einsum("qc,hwq->hwc", cls, 1.0 / (1.0 + np.exp(-mk)))  # (128, 128, 65)
+    return per_pixel @ matrix  # (128, 128, 31); argmax is all we need
+
+
 def confusion(pred, label):
     v = label != 255
     return np.bincount(label[v].astype(np.int64) * NC + pred[v], minlength=NC * NC).reshape(NC, NC)
@@ -78,6 +90,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", nargs="+", required=True)
     ap.add_argument("--acc", nargs="*", default=[])
+    ap.add_argument("--acc-m2f", nargs="*", default=[], help="Mask2Former models (100 query outputs) to score")
+    ap.add_argument("--config", default="", help="config_v1.2.json (teacher class order) for --acc-m2f")
     ap.add_argument("--eval", required=True)
     ap.add_argument("--labels", required=True)
     ap.add_argument("--onnx", required=True)
@@ -93,7 +107,7 @@ def main():
         s = speed(m, a.n_speed)
         print(f"{m:10s} {s['npu_avg']:6.1f}ms {s['npu_min']:6.1f} {s['npu_max']:6.1f} {s['netrun_avg']:9.1f}ms "
               f"{s['ips']:6.1f} {s['load_ms']:5.0f}ms")
-    if not a.acc:
+    if not a.acc and not a.acc_m2f:
         return
 
     names = sorted(f[:-4] for f in os.listdir(a.eval) if f.endswith(".png"))[:a.n_acc]
@@ -130,6 +144,27 @@ def main():
             match.append((got.argmax(-1) == r.argmax(-1)).mean())
             conf += confusion(to_label_size(got, l.shape), l)
         print(f"{m:10s} {np.mean(match) * 100:13.2f}% {min(match) * 100:6.1f}% {miou(conf):11.4f} {miou(conf_ref):10.4f}")
+        shutil.rmtree(local, ignore_errors=True)
+        adb("shell", f"rm -rf {REMOTE}/out_{m}")
+
+    if a.acc_m2f:
+        import json
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from kd import classes as C
+        names65 = [l["readable"] for l in json.load(open(a.config))["labels"]][:65]
+        matrix = C.teacher_merge_matrix(names65).numpy()
+        for m in a.acc_m2f:
+            net_run(m, "eval_list.txt", f"out_{m}")
+            local = os.path.join(a.work, f"out_{m}")
+            shutil.rmtree(local, ignore_errors=True)
+            adb("pull", f"{REMOTE}/out_{m}", local)
+            conf = np.zeros((NC, NC), np.int64)
+            for i, l in enumerate(labels):
+                conf += confusion(to_label_size(m2f_scores(os.path.join(local, f"Result_{i}"), matrix), l.shape), l)
+            print(f"{m:10s} {'(65 -> 31)':>14s} {'':>7s} {miou(conf):11.4f}")
+            shutil.rmtree(local, ignore_errors=True)
+            adb("shell", f"rm -rf {REMOTE}/out_{m}")
 
 
 if __name__ == "__main__":
