@@ -161,6 +161,71 @@ reference, not the truth — biased in favour of our students, which learned fro
 - Head-camera views looking down at the ground are hard for every model (Mapillary is car-mounted, looking forward).
 - B0 here = `nvidia/segformer-b0-finetuned-ade-512-512` with standard normalization; the phone's exact pipeline may differ.
 
+**Run 3 plan (Indian frames, teacher labels only):**
+- Frames: every 3rd unique frame per video. 100 whole videos held out for testing (never trained on):
+  train 11,450 frames / 1,057 videos, test 1,056 frames / 100 videos.
+- Removed before anything else: frames tagged with indoor-only classes (Elevator, Escalator, Couch, Chair,
+  Pedestal fan: 82) and ATM (185, mostly inside booths).
+- Confidence filter (frames and pixels): numbers chosen from two tests — A: teacher accuracy by confidence on
+  Mapillary val (human labels); B: Indian frames by confidence band, judged by eye.
+- After removal: train 11,211 frames, test 1,028 frames.
+- **Test A** (kd/teacher_calibration.py, 300 Mapillary val photos): teacher right 98.9% when ≥ 95% sure (89.7% of
+  pixels); 83% at 90–95%; 73% at 80–90%; ≤ 65% below 0.8. Keeping pixels ≥ 0.9 → 92% kept, 98.5% right;
+  ≥ 0.8 → 94.5% kept, 97.9% right. All Mapillary photos average ≥ 0.80 confidence (weakest 0.80–0.85: 72% right).
+  The teacher is much less sure on Indian frames (24-frame test: average 0.88), so the filter matters more there.
+- **Test B** (kd/confidence_review.py, 2,005 Indian train frames): photos by average confidence — ≥ 0.90: 64%,
+  0.85–0.90: 17%, 0.80–0.85: 9%, < 0.80: 10%. About 27% of Indian pixels are < 0.9 sure (Mapillary: 8%).
+  The unsure pixels are mostly **ground** (mud, dirt, concrete yards, road edges): the teacher can't decide
+  road / sidewalk / terrain there.
+- **Walkable matters:** in India only sidewalk / pavement is walkable; road has vehicles and terrain is rough
+  ground. Mixing these classes is dangerous, so unsure ground must not be learned.
+  → **Filter: photos ≥ 0.80, pixels ≥ 0.9** (keeps ~70% of the Indian data).
+- Root cause: Indian frames don't fit Mapillary (ground types, missing classes such as open drain / speed breaker
+  / mud path, head camera looking down, scenes vary a lot by place). Distillation only passes on what the teacher
+  knows. Human Indian labels (Haidata) are for the full version, not Lite → **Option A: run 3 now** for what the
+  teacher is sure about (Indian vehicles, buildings, clear roads and lanes); walkable ground stays a known gap.
+- App note (not changed here): `hsv2-lite-app/engine/core/nav_classes.h` `navToSemRole` marks floor, road,
+  sidewalk **and terrain** as walkable (on main and origin/main; from the hslite scaffold). Wrong for India;
+  needs an AUDIT row / owner decision.
+- Start from a COPY of the KD student (`saved_models/mapillary_kd_a0.5`); compare run 3 against it and keep the
+  better one.
+- **Run 3 settings:** learning rate 1.2e-5 (5× smaller than runs 1–2, to keep what the model knows), 20,000 steps,
+  batch 8 = 4 Mapillary (CE + KD as before) + 4 Indian (KD only, cells where teacher ≥ 0.9; label all ignore),
+  alpha 0.5, T 2, same 4:3 cut / stretch / zoom / crop / flip for both (kd/dataset.py `_Augment`, `IndianSet`).
+- Tests: line-up on Indian frames — photo, teacher map and learned area line up; padding never learned.
+  20-step trial from the saved KD student: runs, loss ~0.57 (CE 0.20, KD 0.95), GPU 3.1 GB;
+  **saved model checksum unchanged** before/after.
+
+**Run 3 result** (10,144 Indian frames passed the photo filter; 20,000 steps, 1 h 9 min + validation; saved model
+checksum unchanged):
+
+| | KD student (saved) | Run 3 |
+|---|---|---|
+| Mapillary val mIoU (human labels) | 0.5354 | **0.5431** (best at step 12,000) |
+| Held-back Indian videos (1,028 frames): agreement with teacher where teacher ≥ 0.9 sure (75.7% of cells) | 89.7% | **95.3%** |
+| … mean IoU vs teacher | 0.479 | **0.609** |
+
+- Mapillary did not drop; it rose slightly. **Animal 0.00 → 0.25 on Mapillary human labels** (Indian frames have
+  many cows / dogs); on Indian test animal 0 → 0.70.
+- Indian test gains: road 0.80 → 0.93, sidewalk 0.61 → 0.73, terrain 0.73 → 0.95, person 0.56 → 0.79,
+  bus 0.56 → 0.80, other vehicle 0.49 → 0.70, trash can 0.26 → 0.54, traffic light 0.07 → 0.39.
+- Small losses: Mapillary manhole 0.363 → 0.331, barrier 0.549 → 0.531, motorcycle 0.495 → 0.474;
+  Indian bench 0.13 → 0.01 (rare). Pothole and curb cut still 0.
+- Caveats: the Indian numbers compare with the teacher (run 3 was trained to copy it), not with the truth; part of
+  the Mapillary gain may come from the extra training at a small learning rate, not the Indian frames.
+- Saved as `saved_models/run3_indian/` (best.pt from step 12,000, checksum matches the run folder).
+- **Pictures** (kd/compare_frames.py, app's 15 navigation classes, agreement with teacher):
+
+| Frames | KD student (old) | Run 3 | B1 Cityscapes | B0 ADE (phone) |
+|---|---|---|---|---|
+| 24 from the held-back videos (fair) | 82.0% (walkable 84.7%) | **89.8%** (walkable 90.1%) | 71.2% | 73.6% |
+| The earlier 24 (mostly from training videos) | 78.0% | 83.9% | 63.8% | 67.9% |
+
+  Seen: dirt field called "road" by the old model → "terrain" in run 3; goat called "person" by the old model →
+  animal in run 3. Worse: a park dirt footpath next to a railing — run 3 calls part of it "road" (teacher and old
+  model: sidewalk). Walkable ground on Indian frames is still not reliable. Batches 50% Mapillary (human labels +
+  teacher) / 50% Indian (teacher only). One run. Discard if Mapillary val drops.
+
 ## Export to the phone NPU (KD student)
 - Model: KD student (`saved_models/mapillary_kd_a0.5/best.pt`). Not public: binaries stay on the conversion server
   with a private copy on the PC, never in a repo.
