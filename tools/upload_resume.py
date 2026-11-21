@@ -37,8 +37,14 @@ def keep_awake(on):
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | (0x00000001 if on else 0))
 
 
-def ssh(host, command):
-    return subprocess.run(["ssh", *SSH_OPTS, host, command], capture_output=True, text=True)
+def ssh(host, command, timeout=120):
+    """Run a command on the server. No keyboard input (Windows ssh.exe can hang waiting on it).
+    A hang longer than `timeout` seconds counts as a failure (returncode -1), so the caller retries."""
+    try:
+        return subprocess.run(["ssh", *SSH_OPTS, host, command], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess([], -1, "", "timeout")
 
 
 def remote_size(host, path):
@@ -103,7 +109,7 @@ def main():
 
         print("Upload finished. Checking that both copies are identical...")
         local_hash = sha256_local(local)
-        while (r := ssh(host, f"sha256sum '{path}'")).returncode != 0:
+        while (r := ssh(host, f"sha256sum '{path}'", timeout=1800)).returncode != 0:
             print(f"Server not reachable for checksum. Retrying in {RETRY_WAIT}s...")
             time.sleep(RETRY_WAIT)
         remote_hash = r.stdout.split()[0]
