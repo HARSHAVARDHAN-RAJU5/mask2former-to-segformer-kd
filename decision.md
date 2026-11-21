@@ -133,5 +133,33 @@ Per-class differences are small and mixed. Both runs: pothole and animal 0.00, c
 | building | 0.851 | 0.853 | | person | 0.644 | 0.648 | | sky | 0.977 | 0.978 |
 | | | | | | | | | water | 0.805 | 0.782 |
 
+**Saved models** (copies, never trained on): `saved_models/mapillary_kd_a0.5/` and `saved_models/mapillary_kd_a0/`
+(best.pt + best_iou.json + args + val log; checksums match the run folders).
+**Rule: any further training starts from a COPY of a saved model, never overwrites it.**
+
+## Indian frames (next stage)
+- Source: Haidata YOLO delivery, 36,365 unique frames from 1,157 videos (~31 frames each), ~15.8 GB.
+  Indoor and outdoor mixed (classes include Door, Elevator, Couch as well as Pothole, Open drainage, Cow).
+- Only the images are needed: the teacher makes the labels; the YOLO boxes are not used.
+- Concern: noisy frames (blur, dark, indoor, near-duplicates) could teach the student wrong answers.
+
+**Visual test, 24 frames** (kd/compare_frames.py; 4 folders × 6, 24 different videos, all 16:9 → centred 4:3 cut,
+phone-like 512×512; all answers converted to the app's 15 navigation classes; no human labels, so the teacher is the
+reference, not the truth — biased in favour of our students, which learned from Mapillary / the teacher):
+
+| | KD student | Base student | B1 Cityscapes | B0 ADE (phone) |
+|---|---|---|---|---|
+| Agreement with teacher (nav classes) | 78.0% | 77.1% | 63.8% | 67.9% |
+| Walkable area IoU vs teacher | 86.9% | 86.2% | 76.6% | 75.8% |
+
+- On clear street frames our students look clearly better than B0 and B1 Cityscapes (shops, people, footpaths).
+  KD vs base: no visible difference (same as on Mapillary).
+- Teacher confidence flags bad frames: average 0.88, 81% of pixels ≥ 70% sure. Worst: an indoor ATM glass booth
+  (0.50, 0% sure; teacher called it "vehicle"). 3 of 24 frames below 0.80 — all odd views (indoor, close-up
+  looking down, drain).
+- No model has Indian classes (open drain, speed breaker, …): the teacher maps them to the nearest Mapillary class.
+- Head-camera views looking down at the ground are hard for every model (Mapillary is car-mounted, looking forward).
+- B0 here = `nvidia/segformer-b0-finetuned-ade-512-512` with standard normalization; the phone's exact pipeline may differ.
+
 ## Export (later)
 - Build the colour normalization (ImageNet mean/std) into the exported model, so the phone keeps feeding RGB 0–1.
