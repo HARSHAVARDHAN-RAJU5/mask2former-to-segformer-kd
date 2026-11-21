@@ -138,6 +138,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--frames", required=True)
     ap.add_argument("--models", required=True, help="folder with mapillary_kd_a0.5/ and mapillary_kd_a0/")
+    ap.add_argument("--students", nargs="*", default=[],
+                    help="name=path/to/best.pt for our 31-class students (default: kd_student and base_student)")
+    ap.add_argument("--only", default="", help="text file of frame file names to use (default: all in --frames)")
+    ap.add_argument("--n", type=int, default=0, help="random sample of N frames (0 = all)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -145,16 +149,22 @@ def main():
 
     teacher, matrix, _ = T.load()
     ours_lut = lut_by_name(dict(enumerate(C.NAMES)), OURS_TO_NAV)
-    models = {
-        "kd_student": (student(os.path.join(a.models, "mapillary_kd_a0.5", "best.pt")), ours_lut),
-        "base_student": (student(os.path.join(a.models, "mapillary_kd_a0", "best.pt")), ours_lut),
-    }
+    pairs = [s.split("=", 1) for s in a.students] or [
+        ("kd_student", os.path.join(a.models, "mapillary_kd_a0.5", "best.pt")),
+        ("base_student", os.path.join(a.models, "mapillary_kd_a0", "best.pt"))]
+    models = {k: (student(p), ours_lut) for k, p in pairs}
     b1 = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b1-finetuned-cityscapes-1024-1024")
     models["b1_cityscapes"] = (b1.cuda().eval(), lut_by_name(b1.config.id2label, CITYSCAPES_TO_NAV))
     b0 = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
     models["b0_ade_phone"] = (b0.cuda().eval(), ade_lut())
 
     names = sorted(f for f in os.listdir(a.frames) if f.lower().endswith((".jpg", ".jpeg", ".png")))
+    if a.only:
+        wanted = {l.strip() for l in open(a.only) if l.strip()}
+        names = [n for n in names if n in wanted]
+    if a.n:
+        import random
+        names = sorted(random.Random(0).sample(names, min(a.n, len(names))))
     rows, walk_iou = [], {k: [] for k in models}
     for name in names:
         img = Image.open(os.path.join(a.frames, name)).convert("RGB")
