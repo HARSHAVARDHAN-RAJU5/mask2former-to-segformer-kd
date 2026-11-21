@@ -110,5 +110,28 @@ Load warning "swin.layernorm MISSING": layer not used; 97% match confirms the te
 | 4:3 cut validation | 16:9 val photos → label cut to exactly 1.333:1; photo 512×512 |
 | 10-step run (4:3 cut) | Loss 7.88 → 7.24 (warm-up), GPU 3.1 GB; val on 50 photos takes 3 s (→ ~2 min for 2,000) |
 
+## Results (Mapillary val, 2,000 photos, phone-like 512×512)
+| Run | Best mIoU | Pixel acc | Best at step | Training time |
+|---|---|---|---|---|
+| alpha 0.5 (KD + CE) | 0.5354 | 0.9262 | 40,000 (last; still rising slightly) | 1 h 56 min + 10 × ~93 s validation |
+| alpha 0 (CE only, baseline) | **0.5371** | 0.9267 | 40,000 (last; still rising slightly) | 1 h 56 min + 10 × ~93 s validation |
+
+**Result: KD did not help on Mapillary val** (−0.002 mIoU, within noise; at every check the two runs were within ~0.005 after step 8k).
+Per-class differences are small and mixed. Both runs: pothole and animal 0.00, curb cut 0.09 (rare classes not learned).
+
+| Class | KD | Base | | Class | KD | Base | | Class | KD | Base |
+|---|---|---|---|---|---|---|---|---|---|---|
+| road | 0.915 | 0.915 | | wall | 0.489 | 0.481 | | rider | 0.526 | 0.543 |
+| sidewalk | 0.751 | 0.747 | | fence | 0.555 | 0.551 | | animal | 0.000 | 0.000 |
+| crosswalk | 0.552 | 0.548 | | barrier | 0.549 | 0.545 | | car | 0.883 | 0.885 |
+| curb | 0.508 | 0.515 | | pole | 0.452 | 0.480 | | bus | 0.721 | 0.716 |
+| curb cut | 0.092 | 0.088 | | traffic light | 0.533 | 0.544 | | truck | 0.670 | 0.673 |
+| terrain | 0.674 | 0.675 | | traffic sign | 0.587 | 0.594 | | motorcycle | 0.496 | 0.498 |
+| rail track | 0.459 | 0.485 | | bench | 0.155 | 0.138 | | bicycle | 0.525 | 0.534 |
+| pothole | 0.000 | 0.000 | | trash can | 0.354 | 0.345 | | other vehicle | 0.229 | 0.236 |
+| manhole | 0.363 | 0.372 | | street object | 0.406 | 0.403 | | vegetation | 0.877 | 0.879 |
+| building | 0.851 | 0.853 | | person | 0.644 | 0.648 | | sky | 0.977 | 0.978 |
+| | | | | | | | | water | 0.805 | 0.782 |
+
 ## Export (later)
 - Build the colour normalization (ImageNet mean/std) into the exported model, so the phone keeps feeding RGB 0–1.
