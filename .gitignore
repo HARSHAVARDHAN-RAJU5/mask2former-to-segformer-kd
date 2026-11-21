@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+
+# models and their locations stay out of this public repo
+models_location.txt
+*.pt
+*.onnx
+*.bin
