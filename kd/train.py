@@ -9,7 +9,8 @@ loss = alpha * KD + (1 - alpha) * CE
 alpha = 0 -> plain supervised baseline (KD not computed).
 
 Modes:
-  --lineup N      save N pictures (photo | label | teacher map) after zoom/cut/flip, then exit
+  --lineup N      save N pictures (photo | label | teacher map) after 4:3 cut/stretch/zoom/crop/flip, then exit
+                  (add --lineup-wide to check only photos wider than 4:3)
   (default)       train; resumes from <out>/last.pt if it exists
   --max-steps N   stop after N steps in this session (test runs)
 
@@ -45,15 +46,24 @@ def kd_ce_loss(logits, y, t, alpha, T):
     """logits (B,31,h,w) student scores at 1/4 size; y (B,H,W) labels; t (B,31,h,w) teacher probs."""
     logits = logits.float()
     up = F.interpolate(logits, size=y.shape[-2:], mode="bilinear", align_corners=False)
-    ce = F.cross_entropy(up, y, ignore_index=C.IGNORE_ID)
+    if (y != C.IGNORE_ID).any():
+        ce = F.cross_entropy(up, y, ignore_index=C.IGNORE_ID)
+    else:  # every pixel ignored: 0 instead of 0/0 = NaN
+        ce = logits.sum() * 0.0
     if alpha == 0:
         return ce, ce.detach(), torch.zeros((), device=ce.device)
-    valid = (y[:, 2::4, 2::4] != C.IGNORE_ID).float()  # label at the centre of each 4x4 block
-    tgt = t.float().pow(1.0 / T)
-    tgt = tgt / tgt.sum(1, keepdim=True).clamp_min(1e-8)
-    logp = F.log_softmax(logits / T, dim=1)
-    kl = (tgt * (tgt.clamp_min(1e-8).log() - logp)).sum(1)  # (B,h,w); 0 where tgt is 0
-    kd = (kl * valid).sum() / valid.sum().clamp_min(1.0) * T * T
+    valid = y[:, 2::4, 2::4] != C.IGNORE_ID  # label at the centre of each 4x4 block
+    # select valid cells first (padding / ignore cells never enter the maths), then (cells, 31)
+    tv = t.float().permute(0, 2, 3, 1)[valid]
+    lv = logits.permute(0, 2, 3, 1)[valid]
+    if tv.shape[0] == 0:
+        kd = logits.sum() * 0.0
+    else:
+        # = softmax(log(p) / T) without ever taking log(0): classes outside the top 5 stay exactly 0
+        tgt = tv.pow(1.0 / T)
+        tgt = tgt / tgt.sum(1, keepdim=True).clamp_min(1e-8)
+        logp = F.log_softmax(lv / T, dim=1)
+        kd = (tgt * (tgt.clamp_min(1e-8).log() - logp)).sum(1).mean() * T * T  # 0 * finite = 0
     return alpha * kd + (1 - alpha) * ce, ce.detach(), kd.detach()
 
 
@@ -83,7 +93,8 @@ def evaluate(model, loader):
     inter = conf.diag()
     iou = inter / (conf.sum(0) + conf.sum(1) - inter).clamp_min(1)
     present = conf.sum(1) > 0
-    return iou[present].mean().item(), (inter.sum() / conf.sum()).item(), iou
+    per_class = {C.NAMES[k]: (round(iou[k].item(), 4) if present[k] else None) for k in range(n)}
+    return iou[present].mean().item(), (inter.sum() / conf.sum()).item(), per_class
 
 
 def palette():
@@ -93,11 +104,17 @@ def palette():
     return p
 
 
-def lineup(ds, n, out):
-    """Pictures of photo | label | teacher top class after zoom/cut/flip, plus a number:
-    how often the teacher's top class equals the label (should be high if they line up)."""
+def lineup(ds, n, out, wide_only=False):
+    """Pictures of photo | label | teacher top class after 4:3 cut/stretch/zoom/crop/flip, plus a number:
+    how often the teacher's top class equals the label (should be high if they line up).
+    wide_only: pick only photos wider than 4:3 (the ones that get the 4:3 cut)."""
     pal = palette()
-    for k, i in enumerate(random.Random(0).sample(range(len(ds)), n)):
+    order = random.Random(0).sample(range(len(ds)), len(ds))
+    if wide_only:
+        from kd.dataset import cut_4_3
+        order = [i for i in order[:3000]
+                 if cut_4_3(*Image.open(os.path.join(ds.img_dir, ds.names[i] + ".jpg")).size, False)[1] < 1]
+    for k, i in enumerate(order[:n]):
         x, y, t = ds[i]
         photo = ((x * STD + MEAN).clamp(0, 1) * 255).byte().permute(1, 2, 0).numpy()
         lab = pal[y.numpy().astype(np.uint8)]
@@ -107,7 +124,9 @@ def lineup(ds, n, out):
         v = yc != C.IGNORE_ID
         agree = (top[v] == yc[v]).mean() * 100 if v.any() else float("nan")
         Image.fromarray(np.concatenate([photo, lab, tea], 1)).save(os.path.join(out, f"lineup_{k}.jpg"), quality=90)
-        print(f"  lineup_{k}.jpg  {ds.names[i]}  teacher top class = label on {agree:.1f}% of labelled pixels")
+        w, h = Image.open(os.path.join(ds.img_dir, ds.names[i] + ".jpg")).size
+        print(f"  lineup_{k}.jpg  {ds.names[i]}  ({w}x{h}, {w / h:.2f}:1)  "
+              f"teacher top class = label on {agree:.1f}% of labelled pixels")
 
 
 def save(path, obj):
@@ -139,6 +158,7 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--max-steps", type=int, default=0, help="stop after N steps this session (0 = no limit)")
     ap.add_argument("--lineup", type=int, default=0)
+    ap.add_argument("--lineup-wide", action="store_true", help="line-up check on photos wider than 4:3 only")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -147,7 +167,7 @@ def main():
 
     train_ds = TrainSet(a.data, a.cache, side=a.side, crop=a.crop)
     if a.lineup:
-        lineup(train_ds, a.lineup, a.out)
+        lineup(train_ds, a.lineup, a.out, wide_only=a.lineup_wide)
         return
 
     model = SegformerForSemanticSegmentation.from_pretrained(
@@ -230,14 +250,17 @@ def main():
         do_val = step % a.val_every == 0 or step == a.iters
         if do_val:
             t_val = time.time()
-            miou, acc, _ = evaluate(model, val_loader)
+            miou, acc, per_class = evaluate(model, val_loader)
             val_log.write(f"{step},{miou:.4f},{acc:.4f}\n")
             val_log.flush()
-            bar.write(f"[val] step {step}: mIoU {miou:.4f}, pixel acc {acc:.4f}"
+            bar.write(f"[val] step {step}: mIoU {miou:.4f}, pixel acc {acc:.4f}, {time.time() - t_val:.0f} s"
                       + ("  (new best)" if miou > best else ""))
             if miou > best:
                 best = miou
                 save(best_path, {"model": model.state_dict(), "step": step, "miou": miou, "classes": C.NAMES})
+                with open(os.path.join(a.out, "best_iou.json"), "w") as fj:  # per-class IoU of the best model
+                    json.dump({"step": step, "miou": miou, "pixel_acc": acc,
+                               "train_hours_so_far": round(train_time / 3600, 2), "per_class_iou": per_class}, fj, indent=1)
             t_last += time.time() - t_val  # validation time not counted as training time
         if do_val or step % a.save_every == 0 or step == stop_at:
             save(last_path, {"model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(),
